@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 sourcing_radar.db
+sourcing_radar.db-wal
+sourcing_radar.db-shm

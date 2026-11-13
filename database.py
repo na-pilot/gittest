@@ -12,7 +12,9 @@ from datetime import datetime, time as wall_time, timedelta, timezone
 from pathlib import Path
 
 from sub_agents import (
+    CATEGORY_LABELS,
     CHANNEL_WEIGHTS,
+    KEYWORDS_PER_SECTOR,
     ChannelReport,
     MultiChannelTrendScout,
     SourcingPlan,
@@ -24,6 +26,10 @@ from sub_agents import (
 UTC = timezone.utc
 KST = timezone(timedelta(hours=9), "KST")
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("sourcing_radar.db")
+DEFAULT_INTERVAL_SECONDS = 600
+RANKING_WINDOW = timedelta(days=30)
+RANKING_COMPARISON_LAG = timedelta(days=1)
+RANKING_SEED_KEY = "keyword_ranking_seed_v1"
 SCORE_COLUMNS = ", ".join(f"{channel}_score" for channel in CHANNEL_WEIGHTS)
 SCORE_AVERAGES = ", ".join(f"AVG(t.{channel}_score) AS {channel}_score" for channel in CHANNEL_WEIGHTS)
 
@@ -156,34 +162,55 @@ class RadarDatabase:
                         raise
                     time.sleep(0.15 * (attempt + 1))
             conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
-            seeded = conn.execute("SELECT 1 FROM radar_metadata WHERE key = 'initial_seed'").fetchone()
-            if seed and not seeded:
-                empty = conn.execute("SELECT 1 FROM collection_batches LIMIT 1").fetchone() is None
-                if empty:
-                    self._seed(conn, now or utc_now())
-                conn.execute(
-                    "INSERT INTO radar_metadata(key, value) VALUES ('initial_seed', ?)",
-                    ("created" if empty else "existing_data",),
-                )
+            if not seed:
+                return
+            seeded = conn.execute("SELECT 1 FROM radar_metadata WHERE key = ?", (RANKING_SEED_KEY,)).fetchone()
+            if seeded:
+                return
+            non_demo = conn.execute(
+                "SELECT 1 FROM collection_batches WHERE origin NOT IN ('seed', 'simulation') LIMIT 1"
+            ).fetchone()
+            if not non_demo:
+                self._seed(conn, now or utc_now())
+            conn.execute(
+                "INSERT INTO radar_metadata(key, value) VALUES (?, ?)",
+                (RANKING_SEED_KEY, "skipped_non_demo" if non_demo else "created"),
+            )
 
     @staticmethod
     def _seed(conn: sqlite3.Connection, now: datetime) -> None:
-        start, _ = period_bounds(30, now)
-        first = datetime.fromisoformat(start)
-        moments = [first + timedelta(hours=hour) for hour in range(0, 30 * 24, 4)]
-        moments = [moment for moment in moments if moment <= now]
-        current = now.astimezone(UTC)
-        latest = current.replace(minute=current.minute // 10 * 10, second=0, microsecond=0)
-        if latest > moments[-1]:
-            moments.append(latest)
+        interval = DEFAULT_INTERVAL_SECONDS
+        last_slot = int(now.timestamp() // interval) * interval
+        # Include the preceding day so that the prior ranking also has a full 30-day window.
+        first_slot = last_slot - int((RANKING_WINDOW + RANKING_COMPARISON_LAG).total_seconds())
+        first = datetime.fromtimestamp(first_slot, UTC)
+        existing_by_slot: dict[int, set[str]] = {}
+        for row in conn.execute(
+            """SELECT b.observed_at, t.sku
+               FROM collection_batches b JOIN trend_scores t ON t.batch_id = b.id
+               WHERE b.observed_at BETWEEN ? AND ?""",
+            (utc_stamp(first), utc_stamp(now)),
+        ):
+            observed_at = datetime.fromisoformat(row["observed_at"])
+            slot = int(observed_at.timestamp() // interval) * interval
+            existing_by_slot.setdefault(slot, set()).add(row["sku"])
 
+        # Preserve saved observations and sourcing assumptions in older demo databases.
         scout = MultiChannelTrendScout()
         strategist = SourcingStrategistAgent()
-        initial_signals, _ = scout.collect(moments[0])
-        plans = [strategist.plan(signal) for signal in initial_signals]
-        RadarDatabase._upsert_plans(conn, utc_stamp(moments[-1]), plans)
-        for moment in moments:
-            signals, reports = scout.collect(moment)
+        existing_items = {row["sku"] for row in conn.execute("SELECT sku FROM sourcing_items")}
+        initial_signals, _ = scout.collect(first)
+        plans = [strategist.plan(signal) for signal in initial_signals if signal.candidate.sku not in existing_items]
+        RadarDatabase._upsert_plans(conn, utc_stamp(first), plans)
+        for slot in range(first_slot, last_slot + 1, interval):
+            collector = scout
+            if slot in existing_by_slot:
+                missing = tuple(item for item in scout.candidates if item.sku not in existing_by_slot[slot])
+                if not missing:
+                    continue
+                collector = MultiChannelTrendScout(catalog=missing)
+            moment = datetime.fromtimestamp(slot, UTC)
+            signals, reports = collector.collect(moment)
             RadarDatabase._insert_batch(conn, utc_stamp(moment), "seed", signals, reports)
 
     @staticmethod
@@ -294,28 +321,80 @@ class RadarDatabase:
         leader = max(available, key=available.get) if available else None
         return {**dict(totals), "leader": leader, "leader_score": available.get(leader)}
 
-    @staticmethod
-    def _series(conn: sqlite3.Connection, days: int, category: str | None, now: datetime) -> list[dict]:
-        start, end = period_bounds(days, now)
-        local = "substr(b.observed_at, 1, 19), '+9 hours'"
-        # 오늘은 10분 구간으로, 7/30일은 KST 달력 날짜로 그룹화한다.
-        bucket = (
-            f"strftime('%Y-%m-%dT%H:', {local}) || "
-            f"printf('%02d:00', CAST(strftime('%M', {local}) AS INTEGER) / 10 * 10)"
-            if days == 1 else f"date({local})"
+    def get_top20_keywords_by_sector(
+        self, category: str | None = None, *, now: datetime | None = None,
+    ) -> dict[str, list[dict]]:
+        """Rank the latest 30 days and compare against the same window 24 hours ago."""
+        now = now or utc_now()
+        end = utc_stamp(now)
+        now = now.astimezone(UTC)
+        start = utc_stamp(now - RANKING_WINDOW)
+        previous_end = utc_stamp(now - RANKING_COMPARISON_LAG)
+        previous_start = utc_stamp(now - RANKING_WINDOW - RANKING_COMPARISON_LAG)
+        sectors = CATEGORY_LABELS if category is None else (category,)
+        result = {sector: [] for sector in sectors}
+        # Within each batch, normalize over available channels as the scout does.
+        # The stored trend_index is rounded to one decimal; contributions keep full precision.
+        available_weight = " + ".join(
+            f"(CASE WHEN t.{channel}_score IS NULL THEN 0.0 ELSE {weight} END)"
+            for channel, weight in CHANNEL_WEIGHTS.items()
         )
-        rows = conn.execute(
-            f"""SELECT {bucket} AS bucket, i.category, AVG(t.trend_index) AS trend_index,
-                       COUNT(*) AS observations, {SCORE_AVERAGES}
+        contributions = ",\n".join(
+            f"SUM(CASE WHEN b.observed_at > :start THEN "
+            f"t.{channel}_score * {weight} / NULLIF({available_weight}, 0) END) AS {channel}_total"
+            for channel, weight in CHANNEL_WEIGHTS.items()
+        )
+        category_filter = "AND i.category = :category" if category is not None else ""
+        sql = f"""
+            WITH totals AS (
+                SELECT t.sku, i.name AS keyword, i.category,
+                       ROUND(SUM(CASE WHEN b.observed_at > :start THEN t.trend_index END), 1)
+                           AS cumulative_score,
+                       ROUND(SUM(CASE WHEN b.observed_at <= :previous_end THEN t.trend_index END), 1)
+                           AS previous_score,
+                       SUM(CASE WHEN b.observed_at > :start THEN 1 ELSE 0 END) AS observation_count,
+                       {contributions}
                 FROM collection_batches b
                 JOIN trend_scores t ON t.batch_id = b.id
                 JOIN sourcing_items i ON i.sku = t.sku
-                WHERE b.observed_at BETWEEN ? AND ? AND (? IS NULL OR i.category = ?)
-                GROUP BY bucket, i.category
-                ORDER BY bucket, i.category""",
-            (start, end, category, category),
-        )
-        return [dict(row) for row in rows]
+                WHERE b.observed_at > :previous_start AND b.observed_at <= :end
+                      {category_filter}
+                GROUP BY t.sku
+            ), current_ranks AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY category ORDER BY cumulative_score DESC, sku) AS rank
+                FROM totals WHERE cumulative_score IS NOT NULL
+            ), previous_ranks AS (
+                SELECT sku, ROW_NUMBER() OVER (PARTITION BY category ORDER BY previous_score DESC, sku) AS previous_rank
+                FROM totals WHERE previous_score IS NOT NULL
+            )
+            SELECT c.*, p.previous_rank
+            FROM current_ranks c LEFT JOIN previous_ranks p ON p.sku = c.sku
+            WHERE c.rank <= :limit
+            ORDER BY c.category, c.rank
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(sql, {
+                "start": start, "end": end, "previous_start": previous_start, "previous_end": previous_end,
+                "category": category, "limit": KEYWORDS_PER_SECTOR,
+            }).fetchall()
+        for row in rows:
+            if row["category"] not in result:
+                continue
+            channel_totals = {channel: row[f"{channel}_total"] for channel in CHANNEL_WEIGHTS}
+            observed = {channel: total for channel, total in channel_totals.items() if total is not None}
+            previous_rank = row["previous_rank"]
+            result[row["category"]].append({
+                "sku": row["sku"],
+                "keyword": row["keyword"],
+                "rank": row["rank"],
+                "previous_rank": previous_rank,
+                "rank_delta": previous_rank - row["rank"] if previous_rank is not None else None,
+                "cumulative_score": row["cumulative_score"],
+                "observation_count": row["observation_count"],
+                "channel_totals": channel_totals,
+                "leading_channel": max(observed, key=observed.get) if observed else None,
+            })
+        return result
 
     @staticmethod
     def _recommendations(conn: sqlite3.Connection, start: str, end: str, category: str | None) -> list[dict]:
@@ -342,14 +421,12 @@ class RadarDatabase:
         days: int,
         category: str | None,
         *,
-        compare: bool = False,
         now: datetime | None = None,
     ) -> dict:
         now = now or utc_now()
         start, end = period_bounds(days, now)
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN")
-            series = {span: self._series(conn, span, category, now) for span in ((1, 30) if compare else (days,))}
             recommendations = self._recommendations(conn, start, end, category)
             logs = conn.execute(
                 """SELECT b.observed_at, b.origin, l.channel, l.status, l.item_count, l.expected_count,
@@ -360,4 +437,4 @@ class RadarDatabase:
                    LIMIT 80""",
                 (start, end),
             )
-            return {"series": series, "recommendations": recommendations, "logs": [dict(row) for row in logs]}
+            return {"recommendations": recommendations, "logs": [dict(row) for row in logs]}

@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from database import KST, RadarDatabase, utc_now
+from database import DEFAULT_INTERVAL_SECONDS, KST, RadarDatabase, utc_now
 from sub_agents import (
     CHANNEL_WEIGHTS,
     DEFAULT_KRW_PER_RMB,
@@ -24,9 +24,6 @@ from sub_agents import (
     MultiChannelTrendScout,
     SourcingStrategistAgent,
 )
-
-
-DEFAULT_INTERVAL_SECONDS = 600
 
 
 class SchedulerAlreadyRunning(RuntimeError):
@@ -107,7 +104,10 @@ class RadarOrchestrator:
         print(f"  [PLAN] {len(plans)} sourcing strategies prepared", flush=True)
         batch_id = self.database.save_batch(started_at, signals, plans, reports, origin=self.origin)
         self.last_saved_at = utc_now()
-        print(f"  [SAVE] Batch {batch_id}  |  {len(signals)} trend scores  |  {len(reports)} channel logs", flush=True)
+        print(
+            f"  [SAVE] Batch {batch_id}  |  {len(signals)}/{len(self.scout.candidates)} keyword scores"
+            f"  |  {len(reports)} channel logs", flush=True,
+        )
         if not signals:
             self.last_error = "종합 지수를 계산할 수 있는 SKU가 없습니다. 채널 수집 로그를 확인하세요."
 
@@ -115,7 +115,8 @@ class RadarOrchestrator:
         with scheduler_lock(self.database.path):
             self.database.initialize(seed=self.origin == "simulation")
             print(
-                f"SOURCING RADAR  |  {self.origin.upper()}  |  {self.interval:g}s interval\n"
+                f"SOURCING RADAR  |  {self.origin.upper()}  |  {len(self.scout.candidates)} keywords"
+                f"  |  {self.interval:g}s interval\n"
                 f"SQLite: {self.database.path}",
                 flush=True,
             )

@@ -8,18 +8,17 @@ import sqlite3
 from datetime import datetime
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from database import KST, RadarDatabase, resolve_db_path, utc_now
-from sub_agents import CATEGORY_LABELS, CHANNEL_LABELS, CHANNEL_WEIGHTS
+from sub_agents import CATEGORY_LABELS, CHANNEL_LABELS, CHANNEL_WEIGHTS, KEYWORDS_PER_SECTOR
 
 
 PERIOD_LABELS = {1: "오늘 하루", 7: "최근 7일", 30: "최근 30일"}
 CATEGORY_SHORT = {"industrial": "공산품", "beauty": "뷰티", "food": "일반식품"}
 CATEGORY_COLORS = {"공산품": "#4FE2B4", "뷰티": "#B09AFF", "일반식품": "#F9BF6B"}
 CHANNEL_SHORT = {"naver": "네이버", "youtube": "유튜브", "instagram": "인스타그램", "google": "구글"}
+RANK_CHANNEL_NAMES = {**CHANNEL_SHORT, "instagram": "인스타"}
 LOG_STATUS = {"ok": "완료", "partial": "일부 수집", "empty": "신호 없음", "error": "오류"}
 ORIGIN_LABELS = {"seed": "초기 데모", "simulation": "시뮬레이션 배치", "live": "실수집"}
 
@@ -106,6 +105,91 @@ STYLES = """
   .radar-brief { display: grid; gap: .45rem; }
   .radar-brief p { margin: 0; font-size: .88rem; line-height: 1.5; color: #d1ddec; }
   .radar-brief strong { color: #edf5ff; margin-right: .35rem; }
+  .radar-ranking-grid {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; align-items: start;
+  }
+  .radar-ranking-grid.radar-ranking-detail { grid-template-columns: minmax(0, 1fr); }
+  .radar-ranking-panel {
+    --sector-border: color-mix(in srgb, var(--sector-color) 37%, var(--radar-border));
+    min-width: 0; border: 1px solid var(--radar-border); border-top-color: var(--sector-border);
+    border-radius: 13px; overflow: hidden; background: #111a28;
+  }
+  .radar-ranking-panel h3 {
+    margin: 0; padding: .82rem .85rem; font-size: .98rem; color: var(--radar-text);
+    background: linear-gradient(110deg, color-mix(in srgb, var(--sector-color) 9%, #162234), #141e2f);
+    border-bottom: 1px solid var(--radar-border); letter-spacing: -.02em;
+  }
+  .radar-ranking-panel h3::before {
+    content: ""; display: inline-block; width: 7px; height: 7px; margin-right: .55rem;
+    border-radius: 50%; background: var(--sector-color); vertical-align: .12em;
+  }
+  .radar-ranking-scroll { max-height: 32rem; overflow-y: auto; scrollbar-color: #425571 #111a28; }
+  .radar-ranking-detail .radar-ranking-scroll { max-height: none; }
+  .radar-ranking-scroll:focus-visible { outline: 2px solid var(--sector-color); outline-offset: -2px; }
+  .radar-ranking-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .radar-ranking-table th, .radar-ranking-table td { padding: .5rem .26rem; border: 0; }
+  .radar-ranking-table th:first-child, .radar-ranking-table td:first-child { padding-left: .7rem; }
+  .radar-ranking-table th:last-child, .radar-ranking-table td:last-child { padding-right: .7rem; }
+  .radar-ranking-table th {
+    color: var(--radar-muted); font-size: .72rem; font-weight: 600; text-align: left;
+    background: #0e1725; border-bottom: 1px solid var(--radar-border);
+    position: sticky; top: 0; z-index: 1;
+  }
+  .radar-ranking-table th:nth-child(1) { width: 2.5rem; }
+  .radar-ranking-table th:nth-child(2) { width: 2.75rem; }
+  .radar-ranking-table th:nth-child(4) { width: 5.45rem; }
+  .radar-ranking-table th:nth-child(5) { width: 4.2rem; text-align: center; }
+  .radar-ranking-table td {
+    font-size: .84rem; border-bottom: 1px solid #202d41; vertical-align: middle;
+  }
+  .radar-ranking-table tr:last-child td { border-bottom: 0; }
+  .radar-ranking-table tbody tr:nth-child(even) { background: #141f30; }
+  .radar-ranking-table tbody tr:hover { background: #1b2a40; }
+  .radar-ranking-table .ranking-number, .radar-ranking-table .ranking-score {
+    font-variant-numeric: tabular-nums; font-weight: 650;
+  }
+  .radar-ranking-table .ranking-podium { color: var(--sector-color); }
+  .radar-ranking-table .ranking-keyword { line-height: 1.35; overflow-wrap: anywhere; word-break: keep-all; }
+  .radar-ranking-table .ranking-score { text-align: right; white-space: nowrap; }
+  .radar-ranking-table .ranking-channel { text-align: center; }
+  .radar-ranking-table .ranking-meter {
+    height: 3px; width: 100%; margin-top: .22rem; border-radius: 99px; background: #2b394f;
+  }
+  .radar-ranking-table .ranking-meter i {
+    display: block; height: 100%; background: var(--sector-color); border-radius: 99px; opacity: .85;
+  }
+  .ranking-change, .ranking-channel-badge {
+    display: inline-block; padding: .1rem .27rem; border-radius: 5px; white-space: nowrap;
+    font-size: .72rem; line-height: 1.35; font-weight: 650; font-variant-numeric: tabular-nums;
+  }
+  .ranking-up { color: #83efc5; background: #16352f; }
+  .ranking-down { color: #ffb2bc; background: #422731; }
+  .ranking-steady { color: #b3c5dc; background: #223046; }
+  .ranking-new { color: #ffe0a3; background: #473820; }
+  .ranking-channel-badge { color: #b3c5dc; background: #223046; }
+  .ranking-channel-naver { color: #83efb4; background: #17352d; }
+  .ranking-channel-youtube { color: #ffb2bc; background: #412631; }
+  .ranking-channel-instagram { color: #dcc8ff; background: #37294d; }
+  .ranking-channel-google { color: #accfff; background: #203655; }
+  .radar-ranking-empty { color: var(--radar-muted); padding: .85rem; margin: 0; }
+  @media (min-width: 721px) {
+    .radar-ranking-detail .radar-ranking-table th, .radar-ranking-detail .radar-ranking-table td {
+      padding: .62rem 1rem;
+    }
+    .radar-ranking-detail .radar-ranking-table th:nth-child(1) { width: 5.5rem; }
+    .radar-ranking-detail .radar-ranking-table th:nth-child(2) { width: 7rem; }
+    .radar-ranking-detail .radar-ranking-table th:nth-child(4) { width: 26%; }
+    .radar-ranking-detail .radar-ranking-table th:nth-child(5) { width: 14%; }
+    .radar-ranking-detail .radar-ranking-table th:nth-child(6) { width: 8.5rem; text-align: right; }
+    .radar-ranking-detail .ranking-observations { color: var(--radar-muted); text-align: right; }
+  }
+  @media (min-width: 721px) and (max-width: 1110px) {
+    .radar-ranking-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 720px) {
+    .radar-ranking-grid { grid-template-columns: minmax(0, 1fr); }
+    .radar-ranking-detail .ranking-observations { display: none; }
+  }
   @media (max-width: 700px) {
     .block-container { padding: 2.2rem 1rem 2rem; }
     .radar-hero { align-items: flex-start; flex-direction: column; padding: 1rem; gap: .7rem; }
@@ -189,58 +273,86 @@ def render_kpis(db: RadarDatabase, days: int, category: str | None) -> None:
         st.warning(f'최근 배치 오류 · {schedule["last_error"]}')
 
 
-def make_chart(rows: list[dict], days: int, category: str | None) -> go.Figure:
-    frame = pd.DataFrame(rows)
-    frame["time"] = pd.to_datetime(frame["bucket"])
-    frame["label"] = frame["category"].map(CATEGORY_SHORT)
-    hover_columns = []
-    for channel in CHANNEL_WEIGHTS:
-        column = f"{channel}_hover"
-        frame[column] = frame[f"{channel}_score"].map(lambda value: f"{value:.1f}" if pd.notna(value) else "—")
-        hover_columns.append(column)
-    fig = px.line(
-        frame, x="time", y="trend_index", color="label", markers=True,
-        category_orders={"label": list(CATEGORY_COLORS)},
-        color_discrete_map=CATEGORY_COLORS, custom_data=["observations", *hover_columns],
-    )
-    date_format = "%m.%d %H:%M" if days == 1 else "%m.%d"
-    fig.update_traces(
-        line={"width": 2.7}, marker={"size": 5 if days == 1 else 4},
-        hovertemplate=(
-            f"<b>%{{fullData.name}} · %{{x|{date_format}}} KST</b>"
-            "<br>종합 지수 %{y:.1f} · 관측 %{customdata[0]}건"
-            "<br>네이버 %{customdata[1]} · 유튜브 %{customdata[2]}"
-            "<br>인스타그램 %{customdata[3]} · 구글 %{customdata[4]}<extra></extra>"
-        ),
-    )
-    fig.update_layout(
-        template="plotly_dark", height=330, margin={"l": 12, "r": 16, "t": 10, "b": 12},
-        paper_bgcolor="#111a28", plot_bgcolor="#111a28", font={"color": "#d1ddec", "size": 12},
-        legend=go.layout.Legend(orientation="h", y=1.04, yanchor="bottom", x=0, title_text=""),
-        hoverlabel=go.layout.Hoverlabel(bgcolor="#1c2a3f", font_color="#eef5ff", bordercolor="#435574"),
-        hovermode="closest", uirevision=f"{days}:{category}",
-    )
-    fig.update_xaxes(
-        title=None, tickformat="%H:%M" if days == 1 else "%m.%d",
-        gridcolor="#233147", linecolor="#233147", showspikes=True, spikemode="across",
-        spikesnap="cursor", spikedash="dot", spikecolor="#5a708d", nticks=9,
-    )
-    fig.update_yaxes(title="종합 지수", range=[0, 100], dtick=20, gridcolor="#233147", zeroline=False)
-    return fig
+def movement_badge(row: dict) -> str:
+    change = row["rank_delta"]
+    if change is None:
+        label, style, tooltip = "NEW", "new", "24시간 전 비교 구간에 관측 없음"
+    else:
+        tooltip = f'24시간 전 {row["previous_rank"]}위'
+        if change > 0:
+            label, style = f"▲{change}", "up"
+        elif change < 0:
+            label, style = f"▼{-change}", "down"
+        else:
+            label, style = "-", "steady"
+    return f'<span class="ranking-change ranking-{style}" title="{tooltip}">{label}</span>'
 
 
-def render_chart(rows: list[dict], days: int, category: str | None) -> None:
-    with st.container(border=True, key=f"trend-panel-{days}"):
-        st.markdown(f"**{PERIOD_LABELS[days]}**")
-        if not rows:
-            st.info("이 기간에 수집된 트렌드가 없습니다.")
-            return
-        aggregation = "10분 구간 평균" if days == 1 else "일별 평균"
-        st.caption(f"{aggregation} · 한국시간(KST) · 0–100점")
-        st.plotly_chart(
-            make_chart(rows, days, category), width="stretch", theme=None,
-            config={"displaylogo": False, "scrollZoom": False}, key=f"trend-chart-{days}",
-        )
+def ranking_panel(category: str, rows: list[dict], *, detailed: bool) -> str:
+    title = escape(CATEGORY_LABELS[category])
+    color = CATEGORY_COLORS[CATEGORY_SHORT[category]]
+    header = f'<section class="radar-ranking-panel" style="--sector-color:{color}"><h3>{title}</h3>'
+    if not rows:
+        return header + '<p class="radar-ranking-empty">최근 30일 동안 수집된 검색어가 없습니다.</p></section>'
+
+    top_score = rows[0]["cumulative_score"] or 1
+    entries = []
+    for row in rows:
+        score = row["cumulative_score"]
+        percent = score / top_score * 100
+        rank = row["rank"]
+        rank_style = "ranking-number ranking-podium" if rank <= 3 else "ranking-number"
+        channel = row["leading_channel"]
+        channel_label = RANK_CHANNEL_NAMES.get(channel, "—")
+        channel_style = f"ranking-channel-{channel}" if channel in CHANNEL_WEIGHTS else ""
+        channel_details = []
+        for key, total in row["channel_totals"].items():
+            value = f"{total:,.1f}" if total is not None else "—"
+            channel_details.append(f"{RANK_CHANNEL_NAMES[key]} {value}")
+        channel_tooltip = escape(" · ".join(channel_details))
+        observations = f'<td class="ranking-observations">{row["observation_count"]:,}회</td>' if detailed else ""
+        entries.append(f"""
+          <tr>
+            <td class="{rank_style}">{rank}</td>
+            <td>{movement_badge(row)}</td>
+            <td class="ranking-keyword">{escape(row["keyword"])}</td>
+            <td class="ranking-score">{score:,.1f}
+              <div class="ranking-meter" aria-hidden="true"><i style="width:{percent:.2f}%"></i></div>
+            </td>
+            <td class="ranking-channel">
+              <span class="ranking-channel-badge {channel_style}" title="{channel_tooltip}">{channel_label}</span>
+            </td>
+            {observations}
+          </tr>
+        """)
+
+    score_heading = "30일 누적 지수" if detailed else "누적 지수"
+    channel_heading = "주력 반응 채널" if detailed else "채널"
+    observation_heading = '<th scope="col" class="ranking-observations">수집 횟수</th>' if detailed else ""
+    scroll_access = "" if detailed else f'role="region" tabindex="0" aria-label="{title} 순위 스크롤 영역"'
+    return header + f"""
+      <div class="radar-ranking-scroll" {scroll_access}>
+        <table class="radar-ranking-table" aria-label="{title} 최근 30일 인기 검색어">
+          <thead><tr>
+            <th scope="col">순위</th><th scope="col">등락</th><th scope="col">인기 검색어</th>
+            <th scope="col" style="text-align:right">{score_heading}</th>
+            <th scope="col">{channel_heading}</th>
+            {observation_heading}
+          </tr></thead>
+          <tbody>{"".join(entries)}</tbody>
+        </table>
+      </div>
+      </section>
+    """
+
+
+def render_rankings(rankings: dict[str, list[dict]], category: str | None) -> None:
+    st.subheader(f"최근 30일 누적 인기 검색어 TOP {KEYWORDS_PER_SECTOR}")
+    st.caption("30일 배치 점수를 합산합니다. 등락은 24시간 전 순위, 막대는 섹터 1위 점수와 비교합니다.")
+    detailed = category is not None
+    layout = "radar-ranking-grid radar-ranking-detail" if detailed else "radar-ranking-grid"
+    panels = "".join(ranking_panel(sector, rows, detailed=detailed) for sector, rows in rankings.items())
+    st.html(f'<div class="{layout}">{panels}</div>')
 
 
 def channel_bars(row: dict) -> str:
@@ -348,19 +460,15 @@ def render_logs(rows: list[dict]) -> None:
 
 
 @st.fragment(run_every="30s")
-def render_workspace(db: RadarDatabase, days: int, category: str | None, compare: bool) -> None:
+def render_workspace(db: RadarDatabase, days: int, category: str | None) -> None:
     try:
-        view = db.dashboard_view(days, category, compare=compare)
+        now = utc_now()
+        rankings = db.get_top20_keywords_by_sector(category, now=now)
+        view = db.dashboard_view(days, category, now=now)
     except sqlite3.Error as exc:
         st.error(f"소싱 이력을 조회할 수 없습니다. {exc}")
         return
-    st.subheader("트렌드 추이")
-    if compare:
-        for column, span in zip(st.columns(2), (1, 30)):
-            with column:
-                render_chart(view["series"][span], span, category)
-    else:
-        render_chart(view["series"][days], days, category)
+    render_rankings(rankings, category)
     render_board(view["recommendations"])
     render_logs(view["logs"])
 
@@ -381,19 +489,18 @@ def main() -> None:
         st.stop()
 
     with st.container(border=True, key="global-scope"):
-        filters = st.columns([2.8, 1.4, 1], vertical_alignment="bottom")
+        filters = st.columns([2.8, 1.4], vertical_alignment="bottom")
         with filters[0]:
             categories = {"all": "전체", **CATEGORY_LABELS}
             selected = st.pills("카테고리", tuple(categories), default="all", format_func=categories.get, key="category")
         with filters[1]:
             days = st.segmented_control(
                 "조회 기간", tuple(PERIOD_LABELS), default=30, format_func=PERIOD_LABELS.get, key="period",
+                help="KPI, 추천 보드와 수집 로그의 기간입니다. 검색어 랭킹은 항상 최근 30일을 집계합니다.",
             ) or 30
-        with filters[2]:
-            compare = st.toggle("오늘·30일 함께 보기", key="compare")
     category = selected if selected and selected != "all" else None
     render_kpis(db, days, category)
-    render_workspace(db, days, category, compare)
+    render_workspace(db, days, category)
 
 
 if __name__ == "__main__":
