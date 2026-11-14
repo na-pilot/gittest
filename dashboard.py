@@ -5,13 +5,25 @@ from __future__ import annotations
 import html
 import math
 import sqlite3
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+from threading import Event
 
 import pandas as pd
 import streamlit as st
 
+from coupang_catalog import COUPANG_CATEGORIES
+from coupang_collector import (
+    COUPANG_MANUAL_LIVE_LIMIT,
+    GRADES,
+    SAMPLE_SOURCE_LABELS,
+    VOLUME_SOURCE_LABELS,
+    CollectionResult,
+    CoupangCollector,
+    normalize_keyword,
+)
 from database import KST, RadarDatabase, resolve_db_path, utc_now
-from sub_agents import CATEGORY_LABELS, CHANNEL_LABELS, CHANNEL_WEIGHTS, KEYWORDS_PER_SECTOR
+from sub_agents import CATEGORY_LABELS, CHANNEL_LABELS, CHANNEL_WEIGHTS, DEMO_CATALOG, KEYWORDS_PER_SECTOR
 
 
 PERIOD_LABELS = {1: "오늘 하루", 7: "최근 7일", 30: "최근 30일"}
@@ -21,6 +33,13 @@ CHANNEL_SHORT = {"naver": "네이버", "youtube": "유튜브", "instagram": "인
 RANK_CHANNEL_NAMES = {**CHANNEL_SHORT, "instagram": "인스타"}
 LOG_STATUS = {"ok": "완료", "partial": "일부 수집", "empty": "신호 없음", "error": "오류"}
 ORIGIN_LABELS = {"seed": "초기 데모", "simulation": "시뮬레이션 배치", "live": "실수집"}
+COUPANG_GRADE_COLORS = {
+    "매우 좋음": ("#83efc5", "#16352f"),
+    "좋음": ("#afe4b1", "#243933"),
+    "보통": ("#c4d0e3", "#253449"),
+    "나쁨": ("#ffd195", "#49351f"),
+    "매우 나쁨": ("#ffb2bc", "#422731"),
+}
 
 STYLES = """
 <style>
@@ -172,6 +191,29 @@ STYLES = """
   .ranking-channel-instagram { color: #dcc8ff; background: #37294d; }
   .ranking-channel-google { color: #accfff; background: #203655; }
   .radar-ranking-empty { color: var(--radar-muted); padding: .85rem; margin: 0; }
+  .st-key-coupang-keywords [data-testid="stVerticalBlockBorderWrapper"] { background: #111a28; }
+  .coupang-table-wrap {
+    max-height: 27rem; overflow: auto; scrollbar-color: #425571 #111a28;
+    border: 1px solid #26344b; border-radius: 10px; background: #111a28;
+  }
+  .coupang-table-wrap:focus-visible { outline: 2px solid var(--radar-accent); outline-offset: -2px; }
+  .coupang-table { width: 100%; min-width: 830px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .coupang-table :is(th, td) { padding: .58rem .75rem; border: 0; border-bottom: 1px solid #26344b; }
+  .coupang-table th {
+    position: sticky; top: 0; z-index: 1; background: #152237;
+    color: #bfcce0; text-align: left; font-size: .77rem; white-space: nowrap;
+  }
+  .coupang-table td { font-size: .85rem; text-align: left; }
+  .coupang-table .coupang-number { text-align: right; white-space: nowrap; }
+  .coupang-table td:first-child { color: var(--radar-accent); font-weight: 650; }
+  .coupang-table tr:nth-child(even) { background: #151f30; }
+  .coupang-table tbody tr:hover { background: #1b2a40; }
+  .coupang-term { font-weight: 650; }
+  .coupang-category { display: block; margin-top: .14rem; color: var(--radar-muted); font-size: .72rem; }
+  .coupang-badge {
+    display: inline-block; border-radius: 6px; padding: .12rem .46rem;
+    color: var(--badge-color); background: var(--badge-bg); font-size: .74rem; font-weight: 650; white-space: nowrap;
+  }
   @media (min-width: 721px) {
     .radar-ranking-detail .radar-ranking-table th, .radar-ranking-detail .radar-ranking-table td {
       padding: .62rem 1rem;
@@ -355,6 +397,177 @@ def render_rankings(rankings: dict[str, list[dict]], category: str | None) -> No
     st.html(f'<div class="{layout}">{panels}</div>')
 
 
+@st.cache_resource
+def coupang_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="coupang-refresh")
+
+
+def refresh_coupang_snapshot(
+    db: RadarDatabase, day: date, tier1: str | None, tier2: str | None, cancel: Event,
+) -> CollectionResult:
+    result = CoupangCollector().collect(
+        day, tier1, tier2, max_live_keywords=COUPANG_MANUAL_LIVE_LIMIT, stop_event=cancel,
+    )
+    db.save_coupang_snapshot(result.rows)
+    return result
+
+
+def coupang_badge(grade: str) -> str:
+    foreground, background = COUPANG_GRADE_COLORS[grade]
+    return f'<span class="coupang-badge" style="--badge-color:{foreground};--badge-bg:{background}">{grade}</span>'
+
+
+def render_coupang_table(rows: list[dict]) -> None:
+    entries = []
+    for rank, row in enumerate(rows, start=1):
+        keyword = escape(row["keyword"])
+        category = f'{escape(row["tier1_cat"])} · {escape(row["tier2_cat"])}'
+        volume_source = VOLUME_SOURCE_LABELS[row["volume_source"]]
+        sample_source = SAMPLE_SOURCE_LABELS[row["sample_source"]]
+        entries.append(f"""
+          <tr>
+            <td>{rank}</td>
+            <td><span class="coupang-term">{keyword}</span><span class="coupang-category">{category}</span></td>
+            <td class="coupang-number" title="{volume_source}">{row["monthly_search_vol"]:,}</td>
+            <td class="coupang-number" title="{sample_source}">{row["avg_reviews"]:,.1f}</td>
+            <td class="coupang-number" title="{sample_source}">{row["wing_ratio"]:.1f}%</td>
+            <td>{coupang_badge(row["market_size_grade"])}</td>
+            <td>{coupang_badge(row["competition_grade"])}</td>
+          </tr>
+        """)
+    st.html(f"""
+      <div class="coupang-table-wrap" role="region" tabindex="0" aria-label="쿠팡 키워드 순위">
+        <table class="coupang-table" aria-label="쿠팡 키워드 TOP 30">
+          <thead><tr>
+            <th scope="col">순위</th><th scope="col">키워드</th>
+            <th scope="col" class="coupang-number">월 검색량</th>
+            <th scope="col" class="coupang-number">1P 평균 리뷰수</th>
+            <th scope="col" class="coupang-number">일반판매자(윙) 비율(%)</th>
+            <th scope="col">시장 규모</th><th scope="col">경쟁 강도</th>
+          </tr></thead>
+          <tbody>{"".join(entries)}</tbody>
+        </table>
+      </div>
+    """)
+
+
+def render_coupang_selection(rows: list[dict]) -> None:
+    index = st.selectbox(
+        "소싱에 참고할 키워드", range(len(rows)), index=None, placeholder="키워드를 선택하세요",
+        format_func=lambda i: f'{i + 1}위 · {rows[i]["keyword"]}',
+    )
+    if index is None:
+        return
+    row = rows[index]
+    keyword = row["keyword"]
+    st.caption("한국어 키워드 · 코드 블록 오른쪽 아이콘으로 복사")
+    st.code(keyword, language=None, wrap_lines=True)
+    key = normalize_keyword(keyword)
+    candidate = next((item for item in DEMO_CATALOG if normalize_keyword(item.name) == key), None)
+    if candidate is not None and not row["is_brand"]:
+        st.caption("1688 소싱 추천과 일치하는 중문 검색어")
+        st.code(candidate.search_zh, language=None, wrap_lines=True)
+    else:
+        st.caption("1688 검색에 활용하려면 상품 종류와 소재·규격을 중문 검색어로 정리해 보세요.")
+    product_source = "검색 화면 상품 수" if row["product_count_source"] == "page" else "상품 수 예시"
+    sources = f'{SAMPLE_SOURCE_LABELS[row["sample_source"]]} · {VOLUME_SOURCE_LABELS[row["volume_source"]]} · {product_source}'
+    if row["sample_count"]:
+        sources += f' · 상품 {row["sample_count"]}개 (리뷰 {row["review_sample_count"]}개, 가격 {row["price_sample_count"]}개)'
+    st.caption(sources)
+
+
+def render_coupang(db: RadarDatabase) -> None:
+    st.subheader("🛒 쿠팡 카테고리별 키워드 발굴 (1·2차 분류 TOP 30)")
+    with st.container(border=True, key="coupang-keywords"):
+        today = utc_now().astimezone(KST).date()
+        date_range = db.coupang_date_range()
+        selection = st.columns([1.15, 1.3, 1, 0.8], vertical_alignment="bottom")
+        with selection[0]:
+            tier1 = st.selectbox("1차 카테고리 선택", (None, *COUPANG_CATEGORIES), format_func=lambda value: value or "전체")
+        with selection[1]:
+            children = COUPANG_CATEGORIES[tier1] if tier1 else ()
+            tier2 = st.selectbox(
+                "2차 카테고리 선택", (None, *children), format_func=lambda value: value or "전체",
+                disabled=tier1 is None, key=f"coupang-tier2-{tier1}",
+            )
+        with selection[2]:
+            day = st.date_input("기준 날짜", value=today, min_value=date_range[0] if date_range else today, max_value=today)
+        with selection[3]:
+            hide_brands = st.checkbox("브랜드 제거")
+
+        future = st.session_state.get("coupang_refresh_job")
+        if future is not None and future.done():
+            canceled = st.session_state.pop("coupang_refresh_cancel").is_set()
+            try:
+                result = future.result()
+                status = "조회 중지 후 결과 저장" if canceled else "조회 범위 저장 완료"
+                message = f"{status} · {len(result.rows):,}개 키워드 · Ego Lite 관측 {result.observed_count}건"
+                st.session_state["coupang_refresh_message"] = (message, result.note)
+            except Exception as exc:
+                st.session_state["coupang_refresh_message"] = ("갱신 결과를 저장하지 못했습니다.", type(exc).__name__)
+            del st.session_state["coupang_refresh_job"]
+            future = None
+        if st.button(
+            "🔄 에고라이트(Ego Lite)로 현재 카테고리 즉시 갱신",
+            disabled=future is not None or day != today,
+            help=f"오늘 스냅샷을 갱신하고 월 검색량 상위 {COUPANG_MANUAL_LIVE_LIMIT}개를 브라우저로 조회합니다.",
+        ):
+            cancel = Event()
+            st.session_state["coupang_refresh_cancel"] = cancel
+            st.session_state["coupang_refresh_job"] = coupang_executor().submit(
+                refresh_coupang_snapshot, db, day, tier1, tier2, cancel,
+            )
+            st.session_state.pop("coupang_refresh_message", None)
+            st.rerun()
+        if future is not None:
+            st.info("Ego Lite 연결과 쿠팡 첫 페이지 확인 중입니다.")
+            cancel = st.session_state["coupang_refresh_cancel"]
+            if st.button("수집 중지", disabled=cancel.is_set()):
+                cancel.set()
+                st.info("진행 중인 페이지 조회가 끝나면 수집을 중지합니다.")
+        elif "coupang_refresh_message" in st.session_state:
+            message, note = st.session_state["coupang_refresh_message"]
+            st.info(f"{message}. {note}" if note else message)
+
+        with st.expander("세부 수치 필터"):
+            filters = st.columns(4, vertical_alignment="top")
+            with filters[0]:
+                min_volume = st.number_input("최소 월 검색량", min_value=0, max_value=100_000, value=0, step=1000)
+            with filters[1]:
+                max_reviews = st.number_input(
+                    "최대 평균 리뷰수", min_value=0, value=None, step=100,
+                    placeholder="제한 없음", help="예를 들어 2,000을 입력하면 1페이지 평균 리뷰수가 2,000개 이하인 행만 표시합니다.",
+                )
+            with filters[2]:
+                market = st.multiselect("시장 규모", GRADES, placeholder="모든 등급")
+            with filters[3]:
+                competition = st.multiselect("경쟁 강도", GRADES, placeholder="모든 등급")
+        rows = db.get_coupang_keywords(
+            day, tier1, tier2, hide_brands=hide_brands, min_volume=min_volume, max_reviews=max_reviews,
+            market_grades=market, competition_grades=competition,
+        )
+        if not rows:
+            st.info("선택한 날짜와 필터에 맞는 스냅샷이 없습니다.")
+            return
+        cdp_count = sum(row["sample_source"] == "ego_lite" for row in rows)
+        csv_count = sum(row["volume_source"] == "csv" for row in rows)
+        st.caption(
+            f"{day:%Y.%m.%d} KST · {len(rows)}개 · 월 검색량순 · "
+            f"1P 관측 {cdp_count} / 예시 {len(rows) - cdp_count} · 월 검색량 CSV {csv_count} / 예시 {len(rows) - csv_count}"
+        )
+        render_coupang_table(rows)
+        render_coupang_selection(rows)
+        with st.popover("지표 산정 기준"):
+            st.write(
+                "시장 규모는 월 검색량과 첫 페이지 평균 가격의 곱으로 비교합니다. "
+                "경쟁 강도는 등록 상품 수 대비 검색 수요와 평균 리뷰수를 반영하며, ‘매우 좋음’은 경쟁 부담이 낮음을 뜻합니다."
+            )
+            st.caption(
+                "윙 비율은 첫 페이지 최대 36개 상품의 배송 표시 기준입니다. "
+                "판매자로켓과 판매자 배송을 포함하며, 쿠팡 직매입 로켓배송을 제외합니다. 배송 표시가 없는 상품은 일반배송으로 추정합니다."
+            )
+
+
 def channel_bars(row: dict) -> str:
     bars = []
     for channel, label in CHANNEL_SHORT.items():
@@ -469,6 +682,10 @@ def render_workspace(db: RadarDatabase, days: int, category: str | None) -> None
         st.error(f"소싱 이력을 조회할 수 없습니다. {exc}")
         return
     render_rankings(rankings, category)
+    try:
+        render_coupang(db)
+    except sqlite3.Error as exc:
+        st.error(f"쿠팡 스냅샷을 읽을 수 없습니다. {exc}")
     render_board(view["recommendations"])
     render_logs(view["logs"])
 

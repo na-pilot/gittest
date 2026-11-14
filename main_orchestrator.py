@@ -12,9 +12,11 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as wall_time, timedelta
 from pathlib import Path
 
+from coupang_catalog import TOP_KEYWORDS
+from coupang_collector import COUPANG_DAILY_LIVE_LIMIT, CoupangCollector
 from database import DEFAULT_INTERVAL_SECONDS, KST, RadarDatabase, utc_now
 from sub_agents import (
     CHANNEL_WEIGHTS,
@@ -24,6 +26,14 @@ from sub_agents import (
     MultiChannelTrendScout,
     SourcingStrategistAgent,
 )
+
+
+COUPANG_RUN_TIME = wall_time(0, 5)
+
+
+def due_coupang_date(now: datetime) -> date | None:
+    local = now.astimezone(KST)
+    return local.date() if local.time() >= COUPANG_RUN_TIME else None
 
 
 class SchedulerAlreadyRunning(RuntimeError):
@@ -62,14 +72,18 @@ class RadarOrchestrator:
         strategist: SourcingStrategistAgent | None = None,
         *,
         origin: str = "simulation",
+        coupang_live_per_category: int = COUPANG_DAILY_LIVE_LIMIT,
     ):
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("Collection interval must be positive and finite.")
+        if not 0 <= coupang_live_per_category <= TOP_KEYWORDS:
+            raise ValueError(f"Coupang page collection limit must be between 0 and {TOP_KEYWORDS}.")
         self.database = database
         self.interval = interval
         self.scout = scout if scout is not None else MultiChannelTrendScout()
         self.strategist = strategist if strategist is not None else SourcingStrategistAgent()
         self.origin = origin
+        self.coupang_live_per_category = coupang_live_per_category
         self.stop_event = threading.Event()
         self.cycle = 0
         self.started_at: datetime | None = None
@@ -111,6 +125,41 @@ class RadarOrchestrator:
         if not signals:
             self.last_error = "종합 지수를 계산할 수 있는 SKU가 없습니다. 채널 수집 로그를 확인하세요."
 
+    def _run_daily_coupang(self) -> None:
+        last_checked = None
+        collector = CoupangCollector()
+        while not self.stop_event.is_set():
+            day = due_coupang_date(utc_now())
+            if day is not None and day != last_checked:
+                try:
+                    token = self.database.claim_coupang_daily_run(day)
+                except sqlite3.Error as exc:
+                    print(f"  [COUPANG] Could not check the daily schedule: {exc}", file=sys.stderr, flush=True)
+                    self.stop_event.wait(15)
+                else:
+                    last_checked = day
+                    if token:
+                        self._collect_coupang_day(collector, day, token)
+            self.stop_event.wait(1)
+
+    def _collect_coupang_day(self, collector: CoupangCollector, day: date, token: str) -> None:
+        print(f"  [COUPANG] Daily snapshot for {day} (KST)", flush=True)
+        try:
+            result = collector.collect(day, per_category_limit=self.coupang_live_per_category, stop_event=self.stop_event)
+            if self.stop_event.is_set():
+                return
+            self.database.finish_coupang_daily_run(
+                day, token, rows=result.rows, observed_count=result.observed_count, note=result.note,
+            )
+            print(f"  [COUPANG] Saved {len(result.rows)} keywords ({result.observed_count} Ego Lite observations)", flush=True)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:300]
+            print(f"  [COUPANG] {error}", file=sys.stderr, flush=True)
+            try:
+                self.database.finish_coupang_daily_run(day, token, failed=True, note=error)
+            except sqlite3.Error as db_error:
+                print(f"  [COUPANG] Could not record failure: {db_error}", file=sys.stderr, flush=True)
+
     def run(self, *, once: bool = False) -> int:
         with scheduler_lock(self.database.path):
             self.database.initialize(seed=self.origin == "simulation")
@@ -120,6 +169,10 @@ class RadarOrchestrator:
                 f"SQLite: {self.database.path}",
                 flush=True,
             )
+            daily_worker = None
+            if not once:
+                daily_worker = threading.Thread(target=self._run_daily_coupang, name="coupang-daily", daemon=True)
+                daily_worker.start()
             try:
                 while not self.stop_event.is_set():
                     started_monotonic = time.monotonic()
@@ -153,6 +206,9 @@ class RadarOrchestrator:
                             break
                         self.stop_event.wait(min(remaining, 1.0))
             finally:
+                if daily_worker is not None:
+                    self.stop_event.set()
+                    daily_worker.join(timeout=18)
                 self._publish_schedule("offline")
                 print("\nSourcing Radar stopped.", flush=True)
         return 0
@@ -165,10 +221,17 @@ def main() -> int:
     parser.add_argument("--db", type=Path, help="use a different SQLite file")
     parser.add_argument("--krw-per-rmb", type=float, default=DEFAULT_KRW_PER_RMB, help="assumed KRW per RMB (default: 200)")
     parser.add_argument("--platform-fee-pct", type=float, default=DEFAULT_PLATFORM_FEE_PCT, help="assumed fee as percent of sale (default: 12)")
+    parser.add_argument(
+        "--coupang-live-per-category", type=int, default=COUPANG_DAILY_LIVE_LIMIT,
+        help="maximum Coupang pages per subcategory per day, 0 for simulation only (default: 30)",
+    )
     args = parser.parse_args()
     try:
         strategist = SourcingStrategistAgent(args.krw_per_rmb, args.platform_fee_pct)
-        radar = RadarOrchestrator(RadarDatabase(args.db), args.interval, strategist=strategist)
+        radar = RadarOrchestrator(
+            RadarDatabase(args.db), args.interval, strategist=strategist,
+            coupang_live_per_category=args.coupang_live_per_category,
+        )
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -8,9 +8,13 @@ import time
 from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import asdict, fields
-from datetime import datetime, time as wall_time, timedelta, timezone
+from datetime import date, datetime, time as wall_time, timedelta, timezone
+from itertools import groupby
 from pathlib import Path
+from uuid import uuid4
 
+from coupang_catalog import TOP_KEYWORDS
+from coupang_collector import DailyKeyword, competition_grade, demo_snapshot, market_grade
 from sub_agents import (
     CATEGORY_LABELS,
     CHANNEL_WEIGHTS,
@@ -30,6 +34,7 @@ DEFAULT_INTERVAL_SECONDS = 600
 RANKING_WINDOW = timedelta(days=30)
 RANKING_COMPARISON_LAG = timedelta(days=1)
 RANKING_SEED_KEY = "keyword_ranking_seed_v1"
+COUPANG_SEED_DAYS = 7
 SCORE_COLUMNS = ", ".join(f"{channel}_score" for channel in CHANNEL_WEIGHTS)
 SCORE_AVERAGES = ", ".join(f"AVG(t.{channel}_score) AS {channel}_score" for channel in CHANNEL_WEIGHTS)
 
@@ -103,6 +108,41 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     next_run_at TEXT,
     last_error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS coupang_daily_keywords (
+    record_date TEXT NOT NULL,
+    tier1_cat TEXT NOT NULL,
+    tier2_cat TEXT NOT NULL,
+    rank INTEGER NOT NULL CHECK (rank BETWEEN 1 AND 30),
+    keyword TEXT NOT NULL,
+    monthly_search_vol INTEGER NOT NULL CHECK (monthly_search_vol >= 0),
+    avg_reviews REAL NOT NULL CHECK (avg_reviews >= 0),
+    wing_ratio REAL NOT NULL CHECK (wing_ratio BETWEEN 0 AND 100),
+    market_size_grade TEXT NOT NULL,
+    competition_grade TEXT NOT NULL,
+    is_brand INTEGER NOT NULL CHECK (is_brand IN (0, 1)),
+    avg_price_krw INTEGER NOT NULL,
+    product_count INTEGER NOT NULL,
+    sample_count INTEGER NOT NULL,
+    review_sample_count INTEGER NOT NULL,
+    price_sample_count INTEGER NOT NULL,
+    sample_source TEXT NOT NULL,
+    volume_source TEXT NOT NULL,
+    product_count_source TEXT NOT NULL,
+    collected_at TEXT NOT NULL,
+    PRIMARY KEY (record_date, tier1_cat, tier2_cat, keyword)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS coupang_daily_runs (
+    record_date TEXT PRIMARY KEY,
+    claim_token TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'finished', 'error')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    observed_count INTEGER NOT NULL DEFAULT 0,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT ''
+);
 """
 
 PLAN_COLUMNS = tuple(field.name for field in fields(SourcingPlan)) + ("updated_at",)
@@ -112,6 +152,19 @@ VALUES ({", ".join(":" + column for column in PLAN_COLUMNS)})
 ON CONFLICT(sku) DO UPDATE SET
     {", ".join(f"{column} = excluded.{column}" for column in PLAN_COLUMNS if column != "sku")}
 WHERE excluded.updated_at >= sourcing_items.updated_at
+"""
+COUPANG_COLUMNS = tuple(field.name for field in fields(DailyKeyword))
+COUPANG_KEY = ("record_date", "tier1_cat", "tier2_cat", "keyword")
+COUPANG_SOURCE_ORDER = {"seed": 0, "simulation": 1, "ego_lite": 2}
+COUPANG_INSERT = f"""
+INSERT INTO coupang_daily_keywords ({", ".join(COUPANG_COLUMNS)})
+VALUES ({", ".join(":" + column for column in COUPANG_COLUMNS)})
+ON CONFLICT ({", ".join(COUPANG_KEY)}) DO NOTHING
+"""
+COUPANG_UPDATE = f"""
+UPDATE coupang_daily_keywords SET
+    {", ".join(f"{column} = :{column}" for column in COUPANG_COLUMNS if column not in (*COUPANG_KEY, "rank"))}
+WHERE record_date = :record_date AND tier1_cat = :tier1_cat AND tier2_cat = :tier2_cat AND keyword = :keyword
 """
 
 
@@ -164,6 +217,11 @@ class RadarDatabase:
             conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             if not seed:
                 return
+            current_time = now or utc_now()
+            if conn.execute("SELECT 1 FROM coupang_daily_keywords LIMIT 1").fetchone() is None:
+                today = current_time.astimezone(KST).date()
+                for offset in range(COUPANG_SEED_DAYS - 1, -1, -1):
+                    self._merge_coupang_rows(conn, demo_snapshot(today - timedelta(days=offset)))
             seeded = conn.execute("SELECT 1 FROM radar_metadata WHERE key = ?", (RANKING_SEED_KEY,)).fetchone()
             if seeded:
                 return
@@ -171,7 +229,7 @@ class RadarDatabase:
                 "SELECT 1 FROM collection_batches WHERE origin NOT IN ('seed', 'simulation') LIMIT 1"
             ).fetchone()
             if not non_demo:
-                self._seed(conn, now or utc_now())
+                self._seed(conn, current_time)
             conn.execute(
                 "INSERT INTO radar_metadata(key, value) VALUES (?, ?)",
                 (RANKING_SEED_KEY, "skipped_non_demo" if non_demo else "created"),
@@ -290,6 +348,134 @@ class RadarDatabase:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
             return dict(row) if row is not None else None
+
+    @staticmethod
+    def _merge_coupang_rows(conn: sqlite3.Connection, rows: Sequence[DailyKeyword]) -> None:
+        scope_columns = ("record_date", "tier1_cat", "tier2_cat")
+
+        def scope(row: DailyKeyword) -> tuple[str, str, str]:
+            return row.record_date, row.tier1_cat, row.tier2_cat
+
+        for identity, group in groupby(sorted(rows, key=scope), key=scope):
+            scope_params = dict(zip(scope_columns, identity))
+            existing = {row["keyword"]: dict(row) for row in conn.execute(
+                """SELECT * FROM coupang_daily_keywords
+                   WHERE record_date = :record_date AND tier1_cat = :tier1_cat AND tier2_cat = :tier2_cat""",
+                scope_params,
+            )}
+            inserts, updates = [], []
+            for row in group:
+                incoming = asdict(row)
+                old = existing.get(row.keyword)
+                if old is None:
+                    inserts.append(incoming)
+                    continue
+                new_priority = COUPANG_SOURCE_ORDER[row.sample_source]
+                old_priority = COUPANG_SOURCE_ORDER[old["sample_source"]]
+                newer_sample = (new_priority, row.collected_at) >= (old_priority, old["collected_at"])
+                data = (incoming if newer_sample else old).copy()
+
+                # The best source is tracked independently for volume, page sample and product count.
+                volume_data = incoming if row.volume_source == "csv" or old["volume_source"] != "csv" else old
+                if data["product_count_source"] != "page":
+                    seen_count = incoming if row.product_count_source == "page" else old
+                    if seen_count["product_count_source"] == "page":
+                        data["product_count"] = seen_count["product_count"]
+                        data["product_count_source"] = "page"
+                volume = data["monthly_search_vol"] = volume_data["monthly_search_vol"]
+                data["volume_source"] = volume_data["volume_source"]
+                data["market_size_grade"] = market_grade(volume, data["avg_price_krw"])
+                data["competition_grade"] = competition_grade(volume, data["product_count"], data["avg_reviews"])
+                updates.append(data)
+            conn.executemany(COUPANG_INSERT, inserts)
+            conn.executemany(COUPANG_UPDATE, updates)
+            conn.execute(
+                """WITH ranked AS (
+                       SELECT keyword, ROW_NUMBER() OVER (ORDER BY monthly_search_vol DESC, keyword) AS position
+                       FROM coupang_daily_keywords
+                       WHERE record_date = :record_date AND tier1_cat = :tier1_cat AND tier2_cat = :tier2_cat
+                   )
+                   UPDATE coupang_daily_keywords
+                   SET rank = (SELECT position FROM ranked WHERE ranked.keyword = coupang_daily_keywords.keyword)
+                   WHERE record_date = :record_date AND tier1_cat = :tier1_cat AND tier2_cat = :tier2_cat""",
+                scope_params,
+            )
+
+    def save_coupang_snapshot(self, rows: Sequence[DailyKeyword]) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._merge_coupang_rows(conn, rows)
+
+    def coupang_date_range(self) -> tuple[date, date] | None:
+        with closing(self._connect()) as conn:
+            first, last = conn.execute("SELECT MIN(record_date), MAX(record_date) FROM coupang_daily_keywords").fetchone()
+        return (date.fromisoformat(first), date.fromisoformat(last)) if first is not None else None
+
+    def get_coupang_keywords(
+        self,
+        day: date,
+        tier1: str | None = None,
+        tier2: str | None = None,
+        *,
+        hide_brands: bool = False,
+        min_volume: int = 0,
+        max_reviews: int | None = None,
+        market_grades: Sequence[str] = (),
+        competition_grades: Sequence[str] = (),
+    ) -> list[dict]:
+        filters = ["record_date = ?", "monthly_search_vol >= ?"]
+        args: list = [day.isoformat(), min_volume]
+        for column, value in (("tier1_cat", tier1), ("tier2_cat", tier2)):
+            if value is not None:
+                filters.append(f"{column} = ?")
+                args.append(value)
+        if hide_brands:
+            filters.append("is_brand = 0")
+        if max_reviews is not None:
+            filters.append("avg_reviews <= ?")
+            args.append(max_reviews)
+        for column, grades in (("market_size_grade", market_grades), ("competition_grade", competition_grades)):
+            if grades:
+                filters.append(f"{column} IN ({', '.join('?' for _ in grades)})")
+                args.extend(grades)
+        args.append(TOP_KEYWORDS)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM coupang_daily_keywords WHERE {" AND ".join(filters)}
+                    ORDER BY monthly_search_vol DESC, keyword, tier1_cat, tier2_cat LIMIT ?""",
+                args,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_coupang_daily_run(self, day: date, *, now: datetime | None = None) -> str | None:
+        """The scheduler calls this under its process lock; a prior incomplete run can resume."""
+        now = now or utc_now()
+        token = uuid4().hex
+        with closing(self._connect()) as conn, conn:
+            result = conn.execute(
+                """INSERT INTO coupang_daily_runs(record_date, claim_token, status, started_at)
+                   VALUES (?, ?, 'running', ?)
+                   ON CONFLICT (record_date) DO UPDATE SET
+                       claim_token = excluded.claim_token, status = 'running', started_at = excluded.started_at
+                   WHERE coupang_daily_runs.status = 'running'""",
+                (day.isoformat(), token, utc_stamp(now)),
+            )
+            return token if result.rowcount == 1 else None
+
+    def finish_coupang_daily_run(
+        self, day: date, token: str, *, rows: Sequence[DailyKeyword] = (), observed_count: int = 0,
+        note: str = "", failed: bool = False,
+    ) -> None:
+        with closing(self._connect()) as conn, conn:
+            result = conn.execute(
+                """UPDATE coupang_daily_runs SET
+                   status = ?, finished_at = ?, observed_count = ?, row_count = ?, note = ?
+                   WHERE record_date = ? AND claim_token = ? AND status = 'running'""",
+                ("error" if failed else "finished", utc_stamp(utc_now()), observed_count, len(rows), note,
+                 day.isoformat(), token),
+            )
+            if result.rowcount == 1:
+                self._merge_coupang_rows(conn, rows)
 
     def summary(self, days: int, category: str | None, *, now: datetime | None = None) -> dict:
         now = now or utc_now()
